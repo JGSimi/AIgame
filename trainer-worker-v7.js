@@ -1,0 +1,86 @@
+const F=1024,H=96,MAXV=768,NEG=12,LR=.0065,BANK=18;
+let vocab=['<eos>','<unk>'],vmap=new Map(vocab.map((x,i)=>[x,i]));
+let feat=new Float32Array(F*H),tok=new Float32Array(MAXV*H),out=new Float32Array(MAXV*H),bias=new Float32Array(MAXV),bh=new Float32Array(H);
+let pairs=[],userCount=0,running=true,steps=0,stage='auto',autoLevel=0,sliceMs=560;
+let lastReport=performance.now(),reportSteps=0,lossEMA=0,trainAccEMA=0,lastSnapshot=0,nextEval=5000;
+let metrics={overall:0,exact:0,paraphrase:0,compose:0,memory:0,memoryLong:0,interference:0};
+
+const NAMES=['ana','bia','clara','davi','enzo','flora','gabriel','heloisa','igor','julia','leo','maria'];
+const THINGS=['maca','banana','uva','mel','musica','chuva','cafe','livros','cinema','cavalos','praia','chocolate'];
+const COLORS=['azul','verde','vermelho','amarelo','roxo','laranja'];
+const FACTS=[['ceu','azul'],['grama','verde'],['banana','amarela'],['fogo','quente'],['gelo','frio'],['mel','doce'],['limao','azedo'],['pedra','dura'],['algodao','macio']];
+const TRAIN_PARA=[
+ [['oi','ola','e ai','bom dia','boa tarde'],'oi como voce esta'],
+ [['como voce esta','como vai','tudo bem com voce'],'estou bem e aprendendo'],
+ [['quem e voce','o que voce e','me diga quem voce e'],'eu sou uma mosca neural aprendendo a conversar'],
+ [['o que voce quer','qual seu objetivo','o que voce pretende'],'eu quero aprender e conversar melhor'],
+ [['voce aprende','consegue aprender','esta aprendendo'],'sim eu aprendo com treino exemplos e correcoes'],
+ [['podemos conversar','quer conversar','fale comigo'],'sim podemos conversar'],
+ [['obrigado','valeu','muito obrigado'],'de nada'],
+ [['tchau','ate logo','ate mais'],'ate mais']
+];
+const HELD_PARA=[
+ ['salve mosca','oi como voce esta'],['como andam as coisas','estou bem e aprendendo'],['quem esta falando comigo','eu sou uma mosca neural aprendendo a conversar'],
+ ['pra que voce serve','eu quero aprender e conversar melhor'],['da pra voce aprender coisa nova','sim eu aprendo com treino exemplos e correcoes'],['bora trocar ideia','sim podemos conversar'],['agradecido','de nada'],['falou ate outra hora','ate mais']
+];
+
+function rnd(a=.055){return(Math.random()*2-1)*a}
+for(let i=0;i<feat.length;i++)feat[i]=rnd();for(let i=0;i<tok.length;i++)tok[i]=rnd();for(let i=0;i<out.length;i++)out[i]=rnd();
+function norm(s){return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/([!?.,:])/g,' $1 ').replace(/\s+/g,' ').trim()}
+function words(s){return norm(s).split(' ').filter(Boolean)}
+function ensure(w){if(vmap.has(w))return vmap.get(w);if(vocab.length>=MAXV)return 1;const id=vocab.length;vocab.push(w);vmap.set(w,id);for(let j=0;j<H;j++){tok[id*H+j]=rnd();out[id*H+j]=rnd()}return id}
+function ids(s,add=true){return words(s).map(w=>add?ensure(w):(vmap.get(w)??1))}
+function feats(s){const n=norm(s),set=new Set(),ws=n.split(' ').filter(Boolean);for(let wi=0;wi<ws.length;wi++){const w=ws[wi];let h=2166136261;for(let i=0;i<w.length;i++)h=Math.imul(h^w.charCodeAt(i),16777619)>>>0;set.add(h%F);set.add(((h^Math.imul(wi+1,2654435761))>>>0)%F);if(wi>0){let q=2166136261,b=ws[wi-1]+'_'+w;for(let i=0;i<b.length;i++)q=Math.imul(q^b.charCodeAt(i),16777619)>>>0;set.add(q%F)}}for(let i=0;i<n.length-1;i++)set.add(((n.charCodeAt(i)*131+n.charCodeAt(i+1)*17+i*7)>>>0)%F);return[...set].slice(0,72)}
+function utter(s){const fs=feats(s),wi=ids(s,true),v=new Float32Array(H);let den=0;for(const f of fs){const o=f*H;for(let j=0;j<H;j++)v[j]+=feat[o+j];den++}for(const id of wi){const o=id*H;for(let j=0;j<H;j++)v[j]+=.55*tok[o+j];den+=.55}const z=1/Math.max(1,den);let n=0;for(let j=0;j<H;j++){v[j]=Math.tanh(v[j]*z*5);n+=v[j]*v[j]}n=Math.sqrt(n)||1;for(let j=0;j<H;j++)v[j]/=n;return v}
+function newMemory(){return{state:new Float32Array(H),bank:[],turns:0}}
+function cloneMemory(m){return{state:new Float32Array(m.state),bank:m.bank.map(x=>new Float32Array(x)),turns:m.turns}}
+function remember(m,role,text){const u=utter(role+' '+text);for(let j=0;j<H;j++)m.state[j]=Math.tanh(.90*m.state[j]+.62*u[j]);m.bank.push(u);if(m.bank.length>BANK)m.bank.shift();m.turns++;return m}
+function retrieve(m,prompt){const q=utter('usuario '+prompt),r=new Float32Array(H);if(!m||!m.bank.length)return r;const scored=[];for(let i=0;i<m.bank.length;i++){const v=m.bank[i];let d=0;for(let j=0;j<H;j++)d+=q[j]*v[j];d+=.035*(i/m.bank.length);scored.push([i,d])}scored.sort((a,b)=>b[1]-a[1]);const k=Math.min(5,scored.length);let sum=0,ws=[];for(let a=0;a<k;a++){const w=Math.exp(scored[a][1]*5);ws.push(w);sum+=w}for(let a=0;a<k;a++){const v=m.bank[scored[a][0]],w=ws[a]/(sum||1);for(let j=0;j<H;j++)r[j]+=v[j]*w}return r}
+function memoryCtx(m,prompt){if(!m)return{state:null,episodic:null};return{state:m.state,episodic:retrieve(m,prompt)}}
+function memoryEnergy(m){if(!m)return 0;let s=0;for(const x of m.state)s+=x*x;return Math.sqrt(s/H)}
+
+function sig(x){return x>20?1:x<-20?0:1/(1+Math.exp(-x))}
+function hidden(fs,ctx,p1,p2,p3,p4){const h=new Float32Array(H),scale=1/Math.max(1,fs.length);for(let j=0;j<H;j++){let z=bh[j]+tok[p1*H+j]+.52*tok[p2*H+j]+.27*tok[p3*H+j]+.12*tok[p4*H+j];for(const f of fs)z+=feat[f*H+j]*scale;if(ctx?.state)z+=.58*ctx.state[j];if(ctx?.episodic)z+=.82*ctx.episodic[j];h[j]=Math.tanh(z)}return h}
+function score(h,t){let s=bias[t],o=t*H;for(let j=0;j<H;j++)s+=(out[o+j]+.16*tok[o+j])*h[j];return s}
+function trainPair(p,mem=null){const fs=feats(p[0]),ctx=memoryCtx(mem,p[0]),ys=ids(p[1],true);ys.push(0);let p1=0,p2=0,p3=0,p4=0,total=0,correct=0;for(const y of ys){const h=hidden(fs,ctx,p1,p2,p3,p4),dh=new Float32Array(H),sy=score(h,y),py=sig(sy),eosScale=y===0?.16:1,gy=(py-1)*eosScale;total+=-eosScale*Math.log(Math.max(1e-6,py));let oy=y*H;for(let j=0;j<H;j++){dh[j]+=gy*(out[oy+j]+.16*tok[oy+j]);out[oy+j]-=LR*gy*h[j]}bias[y]-=LR*gy;let bestNeg=-1e9;for(let n=0;n<NEG;n++){let q=2+(Math.random()*Math.max(1,vocab.length-2)|0);if(q===y)q=2+((q+11)%Math.max(1,vocab.length-2));const sq=score(h,q);if(sq>bestNeg)bestNeg=sq;const pq=sig(sq),gq=pq,oq=q*H;total+=-.07*Math.log(Math.max(1e-6,1-pq));for(let j=0;j<H;j++){dh[j]+=.07*gq*(out[oq+j]+.16*tok[oq+j]);out[oq+j]-=LR*.07*gq*h[j]}bias[q]-=LR*.07*gq}if(y===0||sy>bestNeg)correct++;const sc=1/Math.max(1,fs.length);for(let j=0;j<H;j++){const dz=dh[j]*(1-h[j]*h[j]);bh[j]-=LR*.12*dz;tok[p1*H+j]-=LR*.44*dz;tok[p2*H+j]-=LR*.23*dz;tok[p3*H+j]-=LR*.12*dz;tok[p4*H+j]-=LR*.06*dz;for(const f of fs)feat[f*H+j]-=LR*.24*dz*sc}p4=p3;p3=p2;p2=p1;p1=y}return{loss:total/ys.length,acc:correct/ys.length}}
+function logits(h){const a=new Float32Array(vocab.length);let m=-1e9;for(let i=0;i<a.length;i++){a[i]=score(h,i);if(a[i]>m)m=a[i]}let s=0;for(let i=0;i<a.length;i++){a[i]=Math.exp((a[i]-m)/.67);s+=a[i]}for(let i=0;i<a.length;i++)a[i]/=s||1;return a}
+function detok(a){return a.join(' ').replace(/ \?/g,'?').replace(/ !/g,'!').replace(/ ,/g,',').replace(/ \./g,'.').replace(/ :/g,':')}
+function chooseToken(p,res,k,creative){let top=[];for(let i=2;i<p.length;i++){let s=p[i],w=vocab[i],repeat=0;for(const x of res)if(x===w)repeat++;if(repeat)s*=repeat===1?.38:.07;if(res.length&&res[res.length-1]===w)s*=.25;top.push([i,s])}top.sort((a,b)=>b[1]-a[1]);if(k>0&&(p[0]||0)>(top[0]?.[1]||0)*.88)return 0;if(!creative||top.length<2)return top[0]?.[0]||2;const kk=Math.min(4,top.length);let sum=0,w=[];for(let i=0;i<kk;i++){const q=Math.pow(Math.max(1e-9,top[i][1]),1/.72);w.push(q);sum+=q}let r=Math.random()*sum;for(let i=0;i<kk;i++){r-=w[i];if(r<=0)return top[i][0]}return top[0][0]}
+function generate(prompt,mem=null,max=24,creative=false){const fs=feats(prompt),ctx=memoryCtx(mem,prompt);let p1=0,p2=0,p3=0,p4=0,res=[],conf=0,hlast=[];for(let k=0;k<max;k++){const h=hidden(fs,ctx,p1,p2,p3,p4),p=logits(h);hlast=Array.from(h);const best=chooseToken(p,res,k,creative);if(best===0){if(res.length)break;continue}const w=vocab[best];if(!w||w==='<unk>')continue;res.push(w);conf+=p[best]||0;p4=p3;p3=p2;p2=p1;p1=best}if(!res.length)res.push('aprendendo');return{text:detok(res),confidence:conf/Math.max(1,res.length),hidden:hlast}}
+function tokenScore(a,b){const aa=words(a),bb=words(b);if(!bb.length)return 0;let hit=0;for(let i=0;i<Math.min(aa.length,bb.length);i++)if(aa[i]===bb[i])hit++;return hit/Math.max(aa.length,bb.length)}
+function exact(a,b){return norm(a)===norm(b)?1:0}
+
+function paraExample(held=false){const src=held?HELD_PARA:TRAIN_PARA,g=src[Math.random()*src.length|0];return held?[g[0],g[1]]:[g[0][Math.random()*g[0].length|0],g[1]]}
+function composeExample(held=false){const f=FACTS[Math.random()*FACTS.length|0],templates=held?[`considerando o que voce sabe como descreve ${f[0]}`,`qual palavra combina com ${f[0]}`]:[`como e ${f[0]}`,`me diga algo sobre ${f[0]}`,`qual a caracteristica de ${f[0]}`];return[templates[Math.random()*templates.length|0],`${f[0]} e ${f[1]}`]}
+function memoryDialogue(depth=1,held=false){const name=NAMES[Math.random()*NAMES.length|0],thing=THINGS[Math.random()*THINGS.length|0],color=COLORS[Math.random()*COLORS.length|0],kind=Math.random();const turns=[];let target='';if(kind<.34){turns.push(['user',held?`pode me chamar de ${name}`:`meu nome e ${name}`]);turns.push(['fly',held?'certo vou tentar lembrar':'prazer em conhecer voce']);for(let i=0;i<depth;i++){turns.push(['user',`vamos falar de ${THINGS[(Math.random()*THINGS.length)|0]}`]);turns.push(['fly','certo podemos continuar'])}turns.push(['user',held?'quem eu disse que sou':'qual e meu nome']);target=`seu nome e ${name}`}
+else if(kind<.67){turns.push(['user',held?`${thing} e algo que eu curto`:`eu gosto de ${thing}`]);turns.push(['fly','entendi']);for(let i=0;i<depth;i++){turns.push(['user',`agora pense na cor ${COLORS[(Math.random()*COLORS.length)|0]}`]);turns.push(['fly','certo'])}turns.push(['user',held?'qual preferencia eu mencionei':'do que eu gosto']);target=`voce gosta de ${thing}`}
+else{turns.push(['user',held?`guarde a cor ${color}`:`lembre desta cor ${color}`]);turns.push(['fly','vou tentar lembrar']);for(let i=0;i<depth;i++){turns.push(['user',`vamos contar ${i+1}`]);turns.push(['fly',`certo ${i+1}`])}turns.push(['user',held?'qual era a cor que eu pedi para guardar':'qual cor eu falei']);target=`a cor era ${color}`}
+return{turns,target}}
+function greetingMemory(held=false){const turns=[['user',held?'salve':'oi'],['fly','oi como voce esta'],['user',held?'eu ja tinha falado com voce agora pouco':'eu ja te cumprimentei']];return{turns,target:'sim voce ja me cumprimentou'}}
+function trainDialogue(d){const mem=newMemory();for(let i=0;i<d.turns.length-1;i++)remember(mem,d.turns[i][0],d.turns[i][1]);const last=d.turns[d.turns.length-1];return trainPair([last[1],d.target],mem)}
+function staticExample(){if(!pairs.length)return null;return pairs[Math.random()*Math.max(1,pairs.length-userCount)|0]}
+function sampleTrain(){if(userCount>0&&Math.random()<.18)return{type:'pair',p:pairs[pairs.length-userCount+(Math.random()*userCount|0)]};if(stage==='conversation')return{type:'dialogue',d:Math.random()<.12?greetingMemory(false):memoryDialogue(1+Math.random()*4|0,false)};const r=Math.random();autoLevel=steps>220000?3:steps>80000?2:steps>20000?1:0;if(stage==='basic')return{type:'pair',p:r<.6?staticExample():paraExample(false)};if(stage==='qa')return{type:'pair',p:r<.6?composeExample(false):staticExample()};if(autoLevel===0)return r<.45?{type:'pair',p:staticExample()}:r<.72?{type:'pair',p:paraExample(false)}:{type:'dialogue',d:memoryDialogue(0,false)};if(autoLevel===1)return r<.28?{type:'pair',p:staticExample()}:r<.52?{type:'pair',p:paraExample(false)}:r<.70?{type:'pair',p:composeExample(false)}:{type:'dialogue',d:memoryDialogue(1+Math.random()*2|0,false)};return r<.18?{type:'pair',p:staticExample()}:r<.36?{type:'pair',p:paraExample(false)}:r<.54?{type:'pair',p:composeExample(false)}:{type:'dialogue',d:Math.random()<.08?greetingMemory(false):memoryDialogue(1+Math.random()*5|0,false)}}
+function augment(s){let x=String(s);if(Math.random()<.10)x='ei '+x;if(Math.random()<.10)x='por favor '+x;if(Math.random()<.14)x=x.replace(/[?!.]/g,'');if(Math.random()<.06)x=x.replace(/voce/g,'vc');return x}
+
+let VAL=[];function buildVal(){const v=[];for(const p of HELD_PARA)v.push({g:'paraphrase',p});for(let i=0;i<20;i++)v.push({g:'compose',p:composeExample(true)});for(let i=0;i<18;i++)v.push({g:'memory',d:memoryDialogue(0,true)});for(let i=0;i<18;i++)v.push({g:'memoryLong',d:memoryDialogue(3,true)});for(let i=0;i<18;i++)v.push({g:'interference',d:memoryDialogue(6,true)});v.push({g:'memoryLong',d:greetingMemory(true)});return v}
+function runDialogue(d){const mem=newMemory();for(let i=0;i<d.turns.length-1;i++)remember(mem,d.turns[i][0],d.turns[i][1]);const last=d.turns[d.turns.length-1];return generate(last[1],mem,24,false).text}
+function evalModel(){if(!VAL.length)VAL=buildVal();const sums={paraphrase:[0,0,0],compose:[0,0,0],memory:[0,0,0],memoryLong:[0,0,0],interference:[0,0,0]};let allTok=0,allEx=0,n=0;for(const it of VAL){const g=it.d?runDialogue(it.d):generate(it.p[0],null,24,false).text,t=it.d?it.d.target:it.p[1],ts=tokenScore(g,t),ex=exact(g,t),a=sums[it.g];a[0]+=ts;a[1]+=ex;a[2]++;allTok+=ts;allEx+=ex;n++}const q=k=>sums[k][2]?sums[k][0]/sums[k][2]:0;return{overall:allTok/n,exact:allEx/n,paraphrase:q('paraphrase'),compose:q('compose'),memory:q('memory'),memoryLong:q('memoryLong'),interference:q('interference')}}
+
+function pack(a){const u=new Uint8Array(a.buffer,a.byteOffset,a.byteLength);let s='',c=0x8000;for(let i=0;i<u.length;i+=c)s+=String.fromCharCode(...u.subarray(i,i+c));return btoa(s)}
+function unpack(str,target){try{const b=atob(str),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);target.set(new Float32Array(u.buffer).subarray(0,target.length));return true}catch{return false}}
+function snapshot(){return{version:7,vocab,feat:pack(feat),tok:pack(tok.subarray(0,vocab.length*H)),out:pack(out.subarray(0,vocab.length*H)),bias:pack(bias.subarray(0,vocab.length)),bh:pack(bh),steps,lossEMA,trainAccEMA,metrics}}
+function restore(s){try{if(!s||s.version!==7||!Array.isArray(s.vocab))return;vocab=s.vocab.slice(0,MAXV);vmap=new Map(vocab.map((x,i)=>[x,i]));unpack(s.feat,feat);if(s.tok){const a=new Float32Array(vocab.length*H);if(unpack(s.tok,a))tok.set(a)}if(s.out){const a=new Float32Array(vocab.length*H);if(unpack(s.out,a))out.set(a)}if(s.bias){const a=new Float32Array(vocab.length);if(unpack(s.bias,a))bias.set(a)}unpack(s.bh,bh);steps=s.steps||0;lossEMA=s.lossEMA||0;trainAccEMA=s.trainAccEMA||0;metrics=s.metrics||metrics;nextEval=steps+5000}catch{}}
+function trainOne(){const e=sampleTrain();if(!e)return false;let r=e.type==='dialogue'?trainDialogue(e.d):trainPair([augment(e.p[0]),e.p[1]],null);lossEMA=steps?lossEMA*.997+r.loss*.003:r.loss;trainAccEMA=steps?trainAccEMA*.997+r.acc*.003:r.acc;steps++;reportSteps++;return true}
+function loop(){if(!running){setTimeout(loop,30);return}const st=performance.now();while(running&&performance.now()-st<sliceMs){if(!trainOne())break}const now=performance.now();if(steps>=nextEval){metrics=evalModel();nextEval=steps+Math.max(6000,Math.floor(reportSteps*1.25))}if(now-lastReport>420){const speed=reportSteps/((now-lastReport)/1000);postMessage({type:'stats',steps,speed,loss:lossEMA,trainAcc:trainAccEMA,...metrics,vocab:vocab.length,pairs:pairs.length+TRAIN_PARA.length,level:autoLevel});reportSteps=0;lastReport=now;if(steps-lastSnapshot>70000){lastSnapshot=steps;postMessage({type:'snapshot',state:snapshot()})}}setTimeout(loop,0)}
+
+let sessionMem=newMemory(),lastInferMem=null,lastInferPrompt='';
+onmessage=e=>{const m=e.data||{};if(m.type==='init'){pairs=m.pairs||[];userCount=m.userCount||0;for(const p of pairs){ids(p[0],true);ids(p[1],true)}for(const g of TRAIN_PARA){for(const q of g[0])ids(q,true);ids(g[1],true)}for(const p of HELD_PARA){ids(p[0],true);ids(p[1],true)}for(const x of NAMES)ensure(x);for(const x of THINGS)ensure(x);for(const x of COLORS)ensure(x);for(const [a,b] of FACTS){ensure(a);ensure(b)}restore(m.state);running=m.running!==false;stage=m.stage||'auto';sliceMs=Math.max(80,Math.min(800,m.sliceMs||560));VAL=buildVal();sessionMem=newMemory();postMessage({type:'ready',vocab:vocab.length,pairs:pairs.length,steps,loss:lossEMA,trainAcc:trainAccEMA,...metrics,memoryTurns:0,memoryEnergy:0});loop()}
+else if(m.type==='run')running=!!m.running;
+else if(m.type==='stage')stage=m.stage||'auto';
+else if(m.type==='speed')sliceMs=Math.max(80,Math.min(800,m.sliceMs||560));
+else if(m.type==='infer'){lastInferMem=cloneMemory(sessionMem);lastInferPrompt=m.prompt;const r=generate(m.prompt,sessionMem,26,true);remember(sessionMem,'usuario',m.prompt);remember(sessionMem,'mosca',r.text);postMessage({type:'infer',id:m.id,...r,memoryTurns:sessionMem.turns,memoryEnergy:memoryEnergy(sessionMem)})}
+else if(m.type==='clearMemory'){sessionMem=newMemory();postMessage({type:'memoryCleared',memoryTurns:0,memoryEnergy:0})}
+else if(m.type==='teach'){const p=[m.prompt,m.reply];pairs.push(p);userCount++;ids(p[0],true);ids(p[1],true);for(let i=0;i<260;i++)trainPair(p,lastInferMem);postMessage({type:'taught',vocab:vocab.length,pairs:pairs.length})}
+else if(m.type==='positive'){const p=[m.prompt,m.reply];pairs.push(p);userCount++;for(let i=0;i<70;i++)trainPair(p,lastInferMem)}
+else if(m.type==='snapshot')postMessage({type:'snapshot',state:snapshot()});
+else if(m.type==='evaluate'){metrics=evalModel();postMessage({type:'evaluation',...metrics})}};
